@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <cstdlib>
 #include <functional>  // std::logical_or 등
+#include <cstring>     // for std::memset
 
 // OS 및 아키텍처 종속 하드웨어 헤더 (x86/x64 환경용)
 #if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
@@ -162,6 +163,8 @@ public:
     }
 
     static Matrix from_row_major(size_t r, size_t c, const std::vector<double>& flat) {
+        if (flat.size() < r * c)
+            throw std::invalid_argument("flat vector size insufficient for matrix dimensions");
         Matrix M(r, c, 0.0); // 패딩 영역 0 초기화를 위해 기본 생성자 사용
         for (size_t i = 0; i < r; ++i) for (size_t j = 0; j < c; ++j) M(i, j) = flat[i * c + j];
         return M;
@@ -184,12 +187,46 @@ SVDResult svd_tall(const Matrix& A) {
 
     if (N <= 1) { /* 생략 무방한 1차원 처리 예외 */ return SVDResult(std::move(U), Matrix(N, N, 0.0), std::move(V)); }
 
+    // [A.2] Column Pivoting: 열 L2 norm 기준 내림차순 정렬 (Drmač & Veselić 기법)
+    // 조건수가 나쁜 행렬에서 Jacobi 수렴 속도를 극적으로 개선
+    {
+        std::vector<double> col_norms_sq(N);
+        std::for_each(std::execution::par_unseq, N_indices.begin(), N_indices.end(), [&](size_t j) noexcept {
+            const double* u_ptr = std::assume_aligned<64>(U.data.get() + j * U.stride);
+            col_norms_sq[j] = std::transform_reduce(std::execution::unseq, u_ptr, u_ptr + M, 0.0,
+                std::plus<>{}, [](double x) noexcept { return x * x; });
+        });
+
+        std::vector<size_t> piv(N);
+        std::iota(piv.begin(), piv.end(), 0);
+        std::sort(piv.begin(), piv.end(), [&](size_t a, size_t b) noexcept {
+            return col_norms_sq[a] > col_norms_sq[b];
+        });
+
+        bool needs_pivot = false;
+        for (size_t j = 0; j < N; ++j) { if (piv[j] != j) { needs_pivot = true; break; } }
+
+        if (needs_pivot) {
+            Matrix U_piv(M, N, Matrix::UninitializedTag{});
+            for (size_t j = 0; j < N; ++j) {
+                const double* src = std::assume_aligned<64>(U.data.get() + piv[j] * U.stride);
+                double* dst = std::assume_aligned<64>(U_piv.data.get() + j * U_piv.stride);
+                std::copy_n(src, M, dst);
+            }
+            U = std::move(U_piv);
+            // V를 순열 행렬로 재설정 (항등 행렬 → P)
+            std::memset(V.data.get(), 0, V.stride * V.cols * sizeof(double));
+            for (size_t j = 0; j < N; ++j) V(piv[j], j) = 1.0;
+        }
+    }
+
     constexpr int MAX_SWEEPS = 30;
     const double tol = std::numeric_limits<double>::epsilon() * static_cast<double>(std::max(M, N));
 
     unsigned int num_cores = std::thread::hardware_concurrency();
     if (num_cores == 0) num_cores = 4;
-    const bool par_outer = (N >= num_cores * 2);
+    // [D.2] 병렬화 임계값 상향: 스레드 생성 오버헤드 대비 충분한 작업량 보장
+    const bool par_outer = (N >= std::max(64u, num_cores * 8));
     const bool par_inner = !par_outer && (M >= 1024);
 
     size_t n_even = N + (N % 2);
@@ -201,7 +238,7 @@ SVDResult svd_tall(const Matrix& A) {
     std::span<std::pair<size_t, size_t>> pairs_buffer(ptr_pairs.get(), n_even / 2);
 
     for (int sweep = 0; sweep < MAX_SWEEPS; ++sweep) {
-        bool any_rotated = false;
+        double sweep_max_off = 0.0;
         for (size_t step = 0; step < n_even - 1; ++step) {
             size_t valid_pairs = 0;
             for (size_t k = 0; k < n_even / 2; ++k) {
@@ -210,7 +247,7 @@ SVDResult svd_tall(const Matrix& A) {
             }
             auto active_pairs = pairs_buffer.subspan(0, valid_pairs);
 
-            auto process_pair = [&](const std::pair<size_t, size_t>& p_idx) noexcept -> bool {
+            auto process_pair = [&](const std::pair<size_t, size_t>& p_idx) noexcept -> double {
                 size_t i = p_idx.first, j = p_idx.second;
 
                 // [최적화] C++20 assume_aligned를 통해 컴파일러에게 포인터 메모리가 
@@ -223,10 +260,16 @@ SVDResult svd_tall(const Matrix& A) {
                     : std::transform_reduce(std::execution::unseq, ui_ptr, ui_ptr + M, uj_ptr, PQR{ 0.0, 0.0, 0.0 }, pqr_combine, pqr_map);
 
                 double p = pqr.p, q = pqr.q, r = pqr.r;
-                if (q == 0.0 || r == 0.0 || std::abs(p) <= tol * std::sqrt(q * r)) return false;
+                double off_diag = (q == 0.0 || r == 0.0) ? 0.0 : std::abs(p) / std::sqrt(q * r);
+                if (off_diag <= tol) return off_diag;
 
                 double theta = (r - q) / (2.0 * p);
-                double t = (std::abs(theta) > 1e150) ? (1.0 / (2.0 * theta)) : (std::copysign(1.0, theta) / (std::abs(theta) + std::hypot(1.0, theta)));
+                double t;
+                if (std::isinf(theta)) {
+                    t = 0.0;
+                } else {
+                    t = std::copysign(1.0, theta) / (std::abs(theta) + std::hypot(1.0, theta));
+                }
                 double c = 1.0 / std::sqrt(1.0 + t * t), s = c * t;
 
                 double* vi_ptr = std::assume_aligned<64>(V.data.get() + i * V.stride);
@@ -242,17 +285,74 @@ SVDResult svd_tall(const Matrix& A) {
                     std::for_each(std::execution::unseq, M_indices.begin(), M_indices.end(), [&](size_t idx) noexcept { apply_rot(ui_ptr[idx], uj_ptr[idx]); });
                     std::for_each(std::execution::unseq, N_indices.begin(), N_indices.end(), [&](size_t idx) noexcept { apply_rot(vi_ptr[idx], vj_ptr[idx]); });
                 }
-                return true;
+                return off_diag;
                 };
 
-            bool step_rotated = (par_outer)
-                ? std::transform_reduce(std::execution::par_unseq, active_pairs.begin(), active_pairs.end(), false, std::logical_or<>{}, process_pair)
-                : std::transform_reduce(std::execution::seq, active_pairs.begin(), active_pairs.end(), false, std::logical_or<>{}, process_pair);
+            auto max_op = [](double a, double b) constexpr noexcept { return a > b ? a : b; };
+            double step_max_off = (par_outer)
+                ? std::transform_reduce(std::execution::par_unseq, active_pairs.begin(), active_pairs.end(), 0.0, max_op, process_pair)
+                : std::transform_reduce(std::execution::seq, active_pairs.begin(), active_pairs.end(), 0.0, max_op, process_pair);
 
-            if (step_rotated) any_rotated = true;
+            if (step_max_off > sweep_max_off) sweep_max_off = step_max_off;
+            // [C.2] Sweep 내부 조기 종료: 직전 sweep이 전체 쌍을 순회한 후,
+            // 현재 sweep에서도 모든 step이 수렴 확인 시 잔여 step 생략
+            if (sweep > 0 && sweep_max_off <= tol) break;
             std::rotate(machines.begin() + 1, machines.end() - 1, machines.end());
         }
-        if (!any_rotated) break;
+        if (sweep_max_off <= tol) break;
+    }
+
+    // [B.1] 수렴 후 V 직교성 검증 및 Modified Gram-Schmidt 재직교화
+    // 수십 sweep 동안 누적된 Givens 회전의 부동소수점 반올림 오차를 보정
+    {
+        const double ortho_tol = std::sqrt(std::numeric_limits<double>::epsilon()); // ≈ 1.5e-8
+        double max_ortho_err = 0.0;
+        bool needs_reorth = false;
+
+        for (size_t i = 0; i < N && !needs_reorth; ++i) {
+            const double* vi_ptr = std::assume_aligned<64>(V.data.get() + i * V.stride);
+            for (size_t j = i + 1; j < N; ++j) {
+                const double* vj_ptr = std::assume_aligned<64>(V.data.get() + j * V.stride);
+                double dot = std::transform_reduce(std::execution::unseq, vi_ptr, vi_ptr + N, vj_ptr, 0.0);
+                double abs_dot = std::abs(dot);
+                if (abs_dot > max_ortho_err) max_ortho_err = abs_dot;
+                if (max_ortho_err > ortho_tol) { needs_reorth = true; break; }
+            }
+        }
+
+        if (needs_reorth) {
+            // Modified Gram-Schmidt: V의 열벡터들을 재직교화
+            for (size_t j = 0; j < N; ++j) {
+                double* vj_ptr = V.data.get() + j * V.stride;
+                for (size_t k = 0; k < j; ++k) {
+                    const double* vk_ptr = std::assume_aligned<64>(V.data.get() + k * V.stride);
+                    double proj = std::transform_reduce(std::execution::unseq, vj_ptr, vj_ptr + N, vk_ptr, 0.0);
+                    for (size_t idx = 0; idx < N; ++idx) vj_ptr[idx] -= proj * vk_ptr[idx];
+                }
+                double norm_sq = std::transform_reduce(std::execution::unseq, vj_ptr, vj_ptr + N, 0.0,
+                    std::plus<>{}, [](double x) noexcept { return x * x; });
+                double norm = std::sqrt(norm_sq);
+                if (norm > std::numeric_limits<double>::min()) {
+                    double inv = 1.0 / norm;
+                    std::for_each(std::execution::unseq, vj_ptr, vj_ptr + N,
+                        [inv](double& x) noexcept { x *= inv; });
+                }
+            }
+
+            // U = A * V 재계산 (열 기반 DAXPY 누적으로 캐시 효율 극대화)
+            // A는 const 참조로 원본이 보존되어 있으므로 정확한 재구성 가능
+            std::for_each(std::execution::par_unseq, N_indices.begin(), N_indices.end(), [&](size_t j) noexcept {
+                double* uj_ptr = std::assume_aligned<64>(U.data.get() + j * U.stride);
+                std::fill_n(uj_ptr, M, 0.0);
+                const double* vj_ptr = std::assume_aligned<64>(V.data.get() + j * V.stride);
+                for (size_t k = 0; k < N; ++k) {
+                    double v_kj = vj_ptr[k];
+                    if (v_kj == 0.0) continue;
+                    const double* ak_ptr = std::assume_aligned<64>(A.data.get() + k * A.stride);
+                    for (size_t i = 0; i < M; ++i) uj_ptr[i] += v_kj * ak_ptr[i];
+                }
+            });
+        }
     }
 
     // 2. 특이값 계산 및 복원 로직
@@ -304,6 +404,16 @@ SVDResult compute_svd(const Matrix& A) {
     HardwareOptimizationGuard hw_guard;
 
     if (A.rows == 0 || A.cols == 0) return SVDResult(Matrix(A), Matrix(A), Matrix(A));
+
+    // [B.3 수정] NaN/Inf 입력 검증 — 열 우선(column-major) 순회로 캐시 적중률 보장
+    for (size_t j = 0; j < A.cols; ++j) {
+        const double* col = A.data.get() + j * A.stride;
+        for (size_t i = 0; i < A.rows; ++i) {
+            if (!std::isfinite(col[i]))
+                throw std::invalid_argument("Input matrix contains NaN or Inf");
+        }
+    }
+
     if (A.rows >= A.cols) return svd_tall(A);
     Matrix At = A.transpose();
     SVDResult res_t = svd_tall(At);
