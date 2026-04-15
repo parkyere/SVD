@@ -12,49 +12,17 @@
 #include <thread>
 #include <utility>
 #include <stdexcept>
-#include <cstdlib>
+#include <new>         // std::align_val_t (C++17 표준)
 #include <functional>  // std::logical_or 등
 #include <cstring>     // for std::memset
 
-// OS 및 아키텍처 종속 하드웨어 헤더 (x86/x64 환경용)
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-#include <xmmintrin.h>
-#include <pmmintrin.h>
-#endif
-
 // =======================================================================
-// [1] 현업 비밀 무기: 하드웨어 Denormal Penalty 원천 차단 가드 (RAII)
-// 극소수점 연산 시 CPU 파이프라인이 100배 느려지는 현상을 하드웨어 단에서 강제 차단
-// =======================================================================
-class HardwareOptimizationGuard {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-    unsigned int old_mxcsr = 0;
-#endif
-public:
-    HardwareOptimizationGuard() noexcept {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-        old_mxcsr = _mm_getcsr();
-        // FTZ (Flush-To-Zero) 및 DAZ (Denormals-Are-Zero) 활성화
-        _mm_setcsr(old_mxcsr | _MM_FLUSH_ZERO_ON | _MM_DENORMALS_ZERO_ON);
-#endif
-    }
-    ~HardwareOptimizationGuard() noexcept {
-#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
-        _mm_setcsr(old_mxcsr);
-#endif
-    }
-};
-
-// =======================================================================
-// [2] 현업 상용 라이브러리급 64-Byte (Cache-Line) 정렬 메모리 할당기
+// [1] 64-Byte (Cache-Line) 정렬 메모리 할당기
+// C++17 표준 정렬 operator new/delete 사용 — 플랫폼 조건 분기 완전 제거
 // =======================================================================
 struct AlignedFree {
     void operator()(void* p) const noexcept {
-#if defined(_MSC_VER) || defined(__MINGW32__)
-        _aligned_free(p);
-#else
-        std::free(p);
-#endif
+        ::operator delete(p, std::align_val_t{ 64 });
     }
 };
 using AlignedDoublePtr = std::unique_ptr<double[], AlignedFree>;
@@ -63,12 +31,7 @@ inline AlignedDoublePtr allocate_aligned_uninitialized(size_t count) {
     if (count == 0) return nullptr;
     size_t bytes = count * sizeof(double);
     size_t alloc_bytes = (bytes + 63) & ~63ULL; // 64바이트 배수로 올림
-#if defined(_MSC_VER) || defined(__MINGW32__)
-    void* ptr = _aligned_malloc(alloc_bytes, 64);
-#else
-    void* ptr = std::aligned_alloc(64, alloc_bytes);
-#endif
-    if (!ptr) throw std::bad_alloc();
+    void* ptr = ::operator new(alloc_bytes, std::align_val_t{ 64 });
     return AlignedDoublePtr(static_cast<double*>(ptr));
 }
 
@@ -77,7 +40,7 @@ constexpr auto pqr_combine = [](const PQR& a, const PQR& b) constexpr noexcept -
 constexpr auto pqr_map = [](double vi, double vj) constexpr noexcept -> PQR { return { vi * vj, vi * vi, vj * vj }; };
 
 // =======================================================================
-// [3] HPC Architecture 적용 Matrix (Padding & Stride 도입)
+// [2] HPC Architecture 적용 Matrix (Padding & Stride 도입)
 // =======================================================================
 class Matrix {
 public:
@@ -174,7 +137,7 @@ public:
 struct SVDResult { Matrix U, Sigma, V; SVDResult(Matrix&& u, Matrix&& s, Matrix&& v) noexcept : U(std::move(u)), Sigma(std::move(s)), V(std::move(v)) {} };
 
 // =======================================================================
-// [4] 현업 투입 레벨 Hestenes Jacobi SVD Engine (assume_aligned 극한 활용)
+// [3] 현업 투입 레벨 Hestenes Jacobi SVD Engine (assume_aligned 극한 활용)
 // =======================================================================
 SVDResult svd_tall(const Matrix& A) {
     const size_t M = A.rows, N = A.cols;
@@ -400,9 +363,6 @@ SVDResult svd_tall(const Matrix& A) {
 }
 
 SVDResult compute_svd(const Matrix& A) {
-    // 진입점 하드웨어 보호막 (Subnormal 마이크로코드 스톨 방지)
-    HardwareOptimizationGuard hw_guard;
-
     if (A.rows == 0 || A.cols == 0) return SVDResult(Matrix(A), Matrix(A), Matrix(A));
 
     // [B.3 수정] NaN/Inf 입력 검증 — 열 우선(column-major) 순회로 캐시 적중률 보장
