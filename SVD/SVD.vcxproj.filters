@@ -13,9 +13,6 @@
       <UniqueIdentifier>{67DA6AB6-F800-4c08-8B7A-83BB121AAD01}</UniqueIdentifier>
       <Extensions>rc;ico;cur;bmp;dlg;rc2;rct;bin;rgs;gif;jpg;jpeg;jpe;resx;tiff;tif;png;wav;mfcribbon-ms</Extensions>
     </Filter>
-    <Filter Include="헤더 파일\detail">
-      <UniqueIdentifier>{c1d4e6a2-8b3f-4d5a-9e7c-1b2d3e4f5a6b}</UniqueIdentifier>
-    </Filter>
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="main.cpp">
@@ -28,21 +25,6 @@
   <ItemGroup>
     <ClInclude Include="svd.hpp">
       <Filter>헤더 파일</Filter>
-    </ClInclude>
-    <ClInclude Include="detail\allocator.hpp">
-      <Filter>헤더 파일\detail</Filter>
-    </ClInclude>
-    <ClInclude Include="detail\householder.hpp">
-      <Filter>헤더 파일\detail</Filter>
-    </ClInclude>
-    <ClInclude Include="detail\qrcp.hpp">
-      <Filter>헤더 파일\detail</Filter>
-    </ClInclude>
-    <ClInclude Include="detail\jacobi.hpp">
-      <Filter>헤더 파일\detail</Filter>
-    </ClInclude>
-    <ClInclude Include="detail\svd_impl.hpp">
-      <Filter>헤더 파일\detail</Filter>
     </ClInclude>
   </ItemGroup>
 </Project>

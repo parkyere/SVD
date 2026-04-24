@@ -137,11 +137,6 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="svd.hpp" />
-    <ClInclude Include="detail\allocator.hpp" />
-    <ClInclude Include="detail\householder.hpp" />
-    <ClInclude Include="detail\qrcp.hpp" />
-    <ClInclude Include="detail\jacobi.hpp" />
-    <ClInclude Include="detail\svd_impl.hpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets">
