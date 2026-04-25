@@ -14,6 +14,9 @@
 #include <vector>
 #include <memory>
 #include <new>      // std::align_val_t
+#include <cassert>
+#include <limits>
+#include <stdexcept>
 
 #ifndef SVD_MAX_MATRIX_BYTES
 #define SVD_MAX_MATRIX_BYTES (8ULL << 30)  // 행렬 1개의 안전 상한 (default 8 GiB)
@@ -24,7 +27,7 @@ namespace svd {
 namespace detail {
     // unique_ptr deleter — _Compressed_pair의 EBO 검사가 complete type을 요구하므로 inline 정의.
     struct AlignedFree {
-        void operator()(void* p) const noexcept {
+        inline void operator()(void* p) const noexcept {
             ::operator delete(p, std::align_val_t{ 64 });
         }
     };
@@ -50,11 +53,17 @@ public:
     Matrix& operator=(Matrix&& other) noexcept;
     ~Matrix();
 
-    std::size_t rows() const noexcept { return rows_; }
-    std::size_t cols() const noexcept { return cols_; }
+    constexpr std::size_t rows() const noexcept { return rows_; }
+    constexpr std::size_t cols() const noexcept { return cols_; }
 
-    double& operator()(std::size_t i, std::size_t j) noexcept;
-    const double& operator()(std::size_t i, std::size_t j) const noexcept;
+    inline double& operator()(std::size_t i, std::size_t j) noexcept {
+        assert(i < rows_ && j < cols_ && "Matrix::operator() index out of range");
+        return data_.get()[j * stride_ + i];
+    }
+    inline const double& operator()(std::size_t i, std::size_t j) const noexcept {
+        assert(i < rows_ && j < cols_ && "Matrix::operator() index out of range");
+        return data_.get()[j * stride_ + i];
+    }
     double& at(std::size_t i, std::size_t j);
     const double& at(std::size_t i, std::size_t j) const;
 
@@ -68,7 +77,14 @@ private:
     std::size_t stride_;
     detail::AlignedDoublePtr data_;
 
-    static std::size_t calculate_stride(std::size_t r);
+    static constexpr std::size_t calculate_stride(std::size_t r) {
+        if (r == 0) return 0;
+        if (r > std::numeric_limits<std::size_t>::max() - 15)
+            throw std::length_error("row dimension too large for stride padding");
+        std::size_t s = (r + 7) & ~std::size_t{ 7 };
+        if (s >= 64 && (s & (s - 1)) == 0) s += 8; // 2의 거듭제곱은 bank conflict 회피용 +1 cache line
+        return s;
+    }
 
     // 내부 SVD 알고리즘이 SIMD 정렬 raw pointer를 직접 다뤄야 하므로 friend.
     friend class SVD;
@@ -95,7 +111,7 @@ enum class SVDMode {
 // =======================================================================
 class SVD {
 public:
-    explicit SVD(const Matrix& A);
+    explicit SVD(const Matrix& A) noexcept;
     SVDResult compute(SVDMode mode = SVDMode::Thin);
 
 private:

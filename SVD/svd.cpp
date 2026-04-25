@@ -28,9 +28,9 @@ namespace svd {
 // =======================================================================
 namespace {
 
-constexpr std::size_t MAX_MATRIX_DOUBLES = SVD_MAX_MATRIX_BYTES / sizeof(double);
+inline constexpr std::size_t MAX_MATRIX_DOUBLES = SVD_MAX_MATRIX_BYTES / sizeof(double);
 
-std::size_t safe_mul(std::size_t a, std::size_t b) {
+constexpr std::size_t safe_mul(std::size_t a, std::size_t b) {
     if (a != 0 && b > std::numeric_limits<std::size_t>::max() / a)
         throw std::length_error("matrix dimension multiplication overflow");
     return a * b;
@@ -71,15 +71,6 @@ inline constexpr auto pqr_map = [](double vi, double vj) noexcept -> PQR {
 // =======================================================================
 // [2] Matrix
 // =======================================================================
-
-std::size_t Matrix::calculate_stride(std::size_t r) {
-    if (r == 0) return 0;
-    if (r > std::numeric_limits<std::size_t>::max() - 15)
-        throw std::length_error("row dimension too large for stride padding");
-    std::size_t s = (r + 7) & ~std::size_t{ 7 };
-    if (s >= 64 && (s & (s - 1)) == 0) s += 8; // 2의 거듭제곱은 bank conflict 회피용 +1 cache line
-    return s;
-}
 
 Matrix::Matrix() noexcept : rows_(0), cols_(0), stride_(0), data_(nullptr) {}
 
@@ -137,16 +128,6 @@ Matrix& Matrix::operator=(const Matrix& other) {
 }
 
 Matrix::~Matrix() = default;
-
-double& Matrix::operator()(std::size_t i, std::size_t j) noexcept {
-    assert(i < rows_ && j < cols_ && "Matrix::operator() index out of range");
-    return data_.get()[j * stride_ + i];
-}
-
-const double& Matrix::operator()(std::size_t i, std::size_t j) const noexcept {
-    assert(i < rows_ && j < cols_ && "Matrix::operator() index out of range");
-    return data_.get()[j * stride_ + i];
-}
 
 double& Matrix::at(std::size_t i, std::size_t j) {
     if (i >= rows_ || j >= cols_)
@@ -207,7 +188,7 @@ SVDResult::SVDResult(Matrix&& u, Matrix&& s, Matrix&& v) noexcept
 // [4] SVD — 파이프라인 구성·실행
 // =======================================================================
 
-SVD::SVD(const Matrix& A) : input_(A) {}
+SVD::SVD(const Matrix& A) noexcept : input_(A) {}
 
 SVDResult SVD::compute(SVDMode mode) {
     if (input_.rows() == 0 || input_.cols() == 0)
